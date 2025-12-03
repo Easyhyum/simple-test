@@ -1,7 +1,8 @@
 import os
 import json, time, csv, gc, subprocess
-# from optimum.rbln import RBLNQwen3ForCausalLM, RBLNLlamaForCausalLM
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from optimum.rbln import RBLNQwen3ForCausalLM, RBLNLlamaForCausalLM
+from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM
 from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk, disable_caching
     
 import torch
@@ -15,31 +16,34 @@ start_time = time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_name = None
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    result = subprocess.run(
-        ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-        capture_output=True,
-        text=True,
-        check=True
-    )
-    device_name = result.stdout.strip().split('\n')[0]
-    device_type = "cuda"
-elif hasattr(torch, 'npu') and torch.npu.is_available():
-    device = torch.device("npu")
-    device_name = "ATOM NPU"
-    device_type = "npu"
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-    device_name = "Apple MPS"
-    device_type = "mps"
-else:
-    device = torch.device("cpu")
-    device_name = "CPU"
-    device_type = "cpu"
+
+try:
+    output = subprocess.run(['rbln-stat'], capture_output=True, text=True, check=True)
+    if 'RBLN-CA22'  in output.stdout:
+        device_name = "ATOM NPU"
+        device_type = "npu"
+except:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        device_name = result.stdout.strip().split('\n')[0]
+        device_type = "cuda"
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        device_name = "Apple MPS"
+        device_type = "mps"
+    else:
+        device = torch.device("cpu")
+        device_name = "CPU"
+        device_type = "cpu"
 
 print(f"Using device: {device_name} ({device_type})")
-
+exit()
 batch_size = 1
 
 print("Loading configuration...")
@@ -71,21 +75,21 @@ def _load_dataset():
 
     return dataset
 
-# def model_load(model_name):
-#     save_path = os.path.join(model_save_path, os.path.basename(model_name))
-#     if 'Qwen3' in model_name:
-#         model = RBLNQwen3ForCausalLM.from_pretrained(
-#             model_id=save_path,
-#             export=False,
-#         )
-#     elif 'Llama' in model_name:
-#         model = RBLNLlamaForCausalLM.from_pretrained(
-#             model_id=save_path,
-#             export=False,
-#         )
-#     else:
-#         raise ValueError(f"Unsupported model name: {model_name}")
-#     return model
+def model_load_npu(model_name):
+    save_path = os.path.join(model_save_path, os.path.basename(model_name))
+    if 'Qwen3' in model_name:
+        model = RBLNQwen3ForCausalLM.from_pretrained(
+            model_id=save_path,
+            export=False,
+        )
+    elif 'Llama' in model_name:
+        model = RBLNLlamaForCausalLM.from_pretrained(
+            model_id=save_path,
+            export=False,
+        )
+    else:
+        raise ValueError(f"Unsupported model name: {model_name}")
+    return model
 
 def model_load(model_name):
     model = AutoModelForCausalLM.from_pretrained(
@@ -125,7 +129,11 @@ if __name__ == "__main__":
 
     for model_name in model_list:
         print(f"Loading model: {model_name}...")
-        model = model_load(model_name)
+        if 'npu' in device_type:
+            model = model_load_npu(model_name)
+        else:
+            model = model_load(model_name)
+        print(f"Model device location: {next(model.parameters()).device}")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -150,11 +158,25 @@ if __name__ == "__main__":
                 attention_mask=input_ids['attention_mask'],  # 중요: attention_mask 명시적으로 전달
                 max_new_tokens=max_new_tokens,
                 do_sample=False,  
-                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+                return_dict_in_generate=True,  # dict 형태로 반환
+                output_scores=True,  # 각 생성 단계의 score 반환
             )
             
+            # KV cache와 생성된 시퀀스 추출
+            generated_sequences = outputs.sequences
+            if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
+                kv_cache = outputs.past_key_values
+                print(f"\nKV cache available: {len(kv_cache)} layers")
+                # 각 레이어의 key, value shape 확인
+                if len(kv_cache) > 0:
+                    print(f"Layer 0 - Key shape: {kv_cache[0][0].shape}, Value shape: {kv_cache[0][1].shape}")
+            else:
+                kv_cache = None
+                print("\nNo KV cache returned")
+            
             # 출력 토큰화 (입력 부분 제외)
-            output_token_ids = outputs[0][input_ids['input_ids'].shape[-1]:].tolist()
+            output_token_ids = generated_sequences[0][input_ids['input_ids'].shape[-1]:].tolist()
             output_tokens_text = [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in output_token_ids]
             
             # 출력 텍스트 전처리
@@ -162,7 +184,7 @@ if __name__ == "__main__":
             processed_output_tokens = "|||".join([str(t) for t in output_token_ids])
             
             generated_texts = tokenizer.decode(
-                outputs[0][input_ids['input_ids'].shape[-1]:], skip_special_tokens=True, clean_up_tokenization_spaces=True
+                generated_sequences[0][input_ids['input_ids'].shape[-1]:], skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
             print(generated_texts)
             

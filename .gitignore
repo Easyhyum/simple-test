@@ -203,6 +203,7 @@ cython_debug/
 
 # results
 output_results/
+kv_cache/
 
 # Marimo
 marimo/_static/

@@ -1,8 +1,8 @@
 import os
 import json, time, csv, gc, subprocess
-from optimum.rbln import RBLNQwen3ForCausalLM, RBLNLlamaForCausalLM
-from transformers import AutoTokenizer
-from transformers import AutoModelForCausalLM
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import DynamicCache
 from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk, disable_caching
     
 import torch
@@ -14,7 +14,13 @@ if not os.path.exists(output_path):
     os.makedirs(output_path)
 start_time = time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+output_path = f"./output_results/{start_time}"
+if not os.path.exists(output_path):
+    os.makedirs(output_path)
+
+batch_size = 1
+tp_num = 1
+device = None
 device_name = None
 
 try:
@@ -43,11 +49,11 @@ except:
         device_type = "cpu"
 
 print(f"Using device: {device_name} ({device_type})")
-exit()
+
 batch_size = 1
 
 print("Loading configuration...")
-with open("paremeter.json", "r") as f:
+with open("parameter.json", "r") as f:
     config = json.load(f)
 
 def _load_dataset():
@@ -76,7 +82,11 @@ def _load_dataset():
     return dataset
 
 def model_load_npu(model_name):
-    save_path = os.path.join(model_save_path, os.path.basename(model_name))
+    from optimum.rbln import RBLNQwen3ForCausalLM, RBLNLlamaForCausalLM
+    save_path = os.path.join(model_save_path, f"batch_size{batch_size}_tp{tp_num}")
+    print(f"model_path: {save_path}")
+    save_path = os.path.join(save_path, os.path.basename(model_name))
+    print(f"model_path: {save_path}")
     if 'Qwen3' in model_name:
         model = RBLNQwen3ForCausalLM.from_pretrained(
             model_id=save_path,
@@ -92,15 +102,28 @@ def model_load_npu(model_name):
     return model
 
 def model_load(model_name):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-        attn_implementation="eager",
-        low_cpu_mem_usage=True,
-    )
+    qantized_flag = True if 'FP8' in model_name or 'quantized' in model_name or '4bit' in model_name or 'w8a8' in model_name else False
+    if qantized_flag:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,  # FP16으로 로드
+        )
+        model = model.to(torch.float16)
     model.eval()
     model.to(device)
+    print(f"Model dtype: {next(model.parameters()).dtype}")
     return model
 
 def save_csv(file_path, data, headers):
@@ -110,6 +133,183 @@ def save_csv(file_path, data, headers):
         if not file_exists:
             writer.writeheader()
         writer.writerow(data)
+
+def save_model_weights(model, model_name, device_type, output_dir):
+    """모델의 모든 레이어 weight를 저장"""
+    weights_dir = os.path.join(output_dir, f"weights_{device_type}")
+    os.makedirs(weights_dir, exist_ok=True)
+    
+    # 전체 모델 이름 유지 (/ -> _로 변환)
+    model_basename = model_name.replace('/', '_')
+    weights_file = os.path.join(weights_dir, f"{model_basename}_weights.pt")
+
+    weight_model = model
+    
+    # 모든 파라미터를 CPU로 이동하여 저장
+    weights_dict = {}
+    try:
+        for name, param in weight_model.named_parameters():
+            weights_dict[name] = {
+                'data': param.detach().cpu().clone(),
+                'shape': list(param.shape),
+                'dtype': str(param.dtype)
+            }
+    except Exception as e:
+        print(f"Error extracting weights: {e}")
+        if device_type == 'npu':
+            del hf_model
+        return None
+    
+    torch.save(weights_dict, weights_file)
+    print(f"Saved {len(weights_dict)} layer weights to {weights_file}")
+    
+    # 통계 정보 저장
+    stats_file = os.path.join(weights_dir, f"{model_basename}_stats.json")
+    stats = {}
+    for name, info in weights_dict.items():
+        tensor = info['data']
+        stats[name] = {
+            'shape': info['shape'],
+            'dtype': info['dtype'],
+            'mean': float(tensor.mean()),
+            'std': float(tensor.std()),
+            'min': float(tensor.min()),
+            'max': float(tensor.max()),
+            'num_params': int(tensor.numel())
+        }
+    
+    with open(stats_file, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"Saved weight statistics to {stats_file}")
+    
+    # NPU용 HuggingFace 모델 메모리 해제
+    if device_type == 'npu':
+        del hf_model
+        gc.collect()
+    
+    return weights_file
+
+def load_kv_cache(model_name, input_index, load_from_device, device):
+    """저장된 KV cache 로드"""
+    model_basename = model_name.replace('/', '_')
+    kv_file = os.path.join(load_from_device, f"{model_basename}_input{input_index}.pt")
+    
+    if not os.path.exists(kv_file):
+        print(f"Warning: KV cache file not found: {kv_file}")
+        return None, None, None
+    
+    print(f"Loading KV cache from {kv_file}")
+    kv_data = torch.load(kv_file, map_location='cpu')
+    
+    # KV cache를 DynamicCache 객체로 변환
+    if kv_data['kv_cache'] is not None:
+        cache = DynamicCache()
+        # 레이어별로 key, value 추가
+        for layer_idx, layer_data in enumerate(kv_data['kv_cache']):
+            key = layer_data['key'].to(device) if device else layer_data['key']
+            value = layer_data['value'].to(device) if device else layer_data['value']
+            # update 메서드 호출 (layer_idx 명시)
+            cache.update(key, value, layer_idx)
+        kv_cache = cache
+    else:
+        kv_cache = None
+    
+    # input_tokens는 이미 list 형태
+    input_token_ids = kv_data['input_tokens']
+    
+    return kv_cache, input_token_ids, kv_data
+
+def save_kv_cache(kv_cache, input_text, input_tokens, output_text, output_tokens, 
+                  model_name, device_name, input_index, output_dir):
+    """KV cache와 입출력 데이터를 저장"""
+    # 디바이스별 디렉토리 생성
+    device_dir = os.path.join(output_dir, device_name.replace(' ', '_'))
+    os.makedirs(device_dir, exist_ok=True)
+    
+    # 전체 모델 이름 유지 (/ -> _로 변환)
+    model_basename = model_name.replace('/', '_')
+    
+    # KV cache 파일명
+    kv_file = os.path.join(device_dir, f"{model_basename}_input{input_index}.pt")
+    
+    # KV cache 데이터 준비
+    kv_data = {
+        'input_text': input_text,
+        'input_tokens': input_tokens,
+        'output_text': output_text,
+        'output_tokens': output_tokens,
+        'model_name': model_name,
+        'device': device_name,
+        'input_index': input_index,
+    }
+    
+    # KV cache 저장 (CPU로 이동)
+    if kv_cache is not None:
+        kv_list = []
+        # DynamicCache를 legacy tuple 형식으로 변환
+        if hasattr(kv_cache, 'to_legacy_cache'):
+            legacy_cache = kv_cache.to_legacy_cache()
+        else:
+            # DynamicCache를 직접 접근하여 tuple로 변환
+            try:
+                legacy_cache = [(kv_cache[i][0], kv_cache[i][1]) for i in range(len(kv_cache))]
+            except:
+                # 다른 방법으로 접근
+                legacy_cache = []
+                for i in range(len(kv_cache)):
+                    legacy_cache.append((kv_cache[i][0], kv_cache[i][1]))
+        
+        for layer_idx, (key, value) in enumerate(legacy_cache):
+            key_tensor = key.detach().cpu().clone()
+            value_tensor = value.detach().cpu().clone()
+            kv_list.append({
+                'key': key_tensor,
+                'value': value_tensor,
+                'key_shape': list(key_tensor.shape),
+                'value_shape': list(value_tensor.shape),
+                'key_dtype': str(key_tensor.dtype),
+                'value_dtype': str(value_tensor.dtype),
+            })
+        kv_data['kv_cache'] = kv_list
+        kv_data['num_layers'] = len(kv_list)
+    else:
+        kv_data['kv_cache'] = None
+        kv_data['num_layers'] = 0
+    
+    # 파일 저장
+    torch.save(kv_data, kv_file)
+    print(f"Saved KV cache to {kv_file}")
+    
+    # 메타데이터 JSON 저장 (KV cache 텐서 제외)
+    meta_file = os.path.join(device_dir, f"{model_basename}_input{input_index}_meta.json")
+    meta_data = {
+        'input_text': input_text,
+        'input_tokens': input_tokens,
+        'output_text': output_text,
+        'output_tokens': output_tokens,
+        'model_name': model_name,
+        'device': device_name,
+        'input_index': input_index,
+        'num_layers': kv_data['num_layers'],
+    }
+    
+    if kv_cache is not None and len(kv_data['kv_cache']) > 0:
+        meta_data['kv_shapes'] = [
+            {
+                'layer': i,
+                'key_shape': item['key_shape'],
+                'value_shape': item['value_shape'],
+                'key_dtype': item['key_dtype'],
+                'value_dtype': item['value_dtype'],
+            }
+            for i, item in enumerate(kv_data['kv_cache'])
+        ]
+    
+    with open(meta_file, 'w') as f:
+        json.dump(meta_data, f, indent=2)
+    print(f"Saved metadata to {meta_file}")
+    
+    return kv_file
 
 if __name__ == "__main__":
     # Load dataset configuration from hyperparameter.json
@@ -123,6 +323,16 @@ if __name__ == "__main__":
     print(model_list)
 
     max_new_tokens = config.get('max_new_tokens', 40960)
+    
+    # KV cache 설정
+    kv_cache_config = config.get('kv_cache', {})
+    save_kv = kv_cache_config.get('save', False)
+    load_kv = kv_cache_config.get('load', False)
+    load_from_device = kv_cache_config.get('load_from_device', '')
+    
+    print(f"KV Cache Config - Save: {save_kv}, Load: {load_kv}")
+    if load_kv:
+        print(f"Loading KV cache from: {load_from_device}")
 
     csv_headers = ['device', 'model', 'type', 'batch_size', 'data_index', 'input_text', 'input_tokens', 'output_text', 'output_tokens']
     csv_file_path = os.path.join(output_path, f"{device_name.replace(' ', '_')}_input_output_summary_{start_time}.csv")
@@ -130,63 +340,182 @@ if __name__ == "__main__":
     for model_name in model_list:
         print(f"Loading model: {model_name}...")
         if 'npu' in device_type:
+            if '8B' in model_name:
+                print(f"Using tp=2 for model {model_name}")
+                tp_num = 2
+            else:
+                print(f"Using tp=1 for model {model_name}")
+                tp_num = 1
             model = model_load_npu(model_name)
         else:
             model = model_load(model_name)
         print(f"Model device location: {next(model.parameters()).device}")
+        
+        # print(model)
+        # continue
+        # 모델 weight 저장
+        # weights_file = save_model_weights(model, model_name, device_type, output_path)
+        
+        # continue
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.pad_token = tokenizer.eos_token
-
+        
         for idx, input_ids in enumerate(final_dataset):
             prompt_text = input_ids['prompt_text']
-            print(f"<<{idx}. input: {prompt_text},")
+            
             input_ids = tokenizer(prompt_text, return_tensors="pt")
             
             # 입력 토큰화
             input_token_ids = input_ids['input_ids'][0].tolist()
             input_tokens_text = [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in input_token_ids]
-            input_ids = {key: value.to(device) for key, value in input_ids.items()}
-            # 텍스트 전처리: 콤마를 <comma>로, 줄바꿈을 <br>로 변경
+            
+            # KV cache 로드 여부 확인
+            past_key_values = None
+            original_input_length = len(input_token_ids)
+            
+            if load_kv:
+                loaded_kv, loaded_input_tokens, loaded_data = load_kv_cache(
+                    model_name=model_name,
+                    input_index=idx,
+                    load_from_device=load_from_device,
+                    device=device
+                )
+                
+                if loaded_kv is not None and loaded_input_tokens is not None:
+                    # 로드된 입력과 현재 입력이 일치하는지 확인
+                    if loaded_input_tokens == input_token_ids:
+                        print(f"\n[KV Cache Loaded] Using cached KV for {len(loaded_input_tokens)-1} tokens")
+                        print(f"Original input length: {len(input_token_ids)}, Using last token only")
+                        
+                        # 마지막 토큰만 사용
+                        last_token_id = input_token_ids[-1]
+                        input_ids['input_ids'] = torch.tensor([[last_token_id]], dtype=torch.long)
+                        
+                        # Attention mask: 전체 시퀀스 길이에 대해 1로 설정
+                        input_ids['attention_mask'] = torch.ones((1, original_input_length), dtype=torch.long)
+                        
+                        past_key_values = loaded_kv
+                    else:
+                        print(f"\n[Warning] Input mismatch! Loaded: {len(loaded_input_tokens)} tokens, Current: {len(input_token_ids)} tokens")
+                        print("Proceeding without cached KV...")
+            
+            # 입력을 FP16으로 변환하여 device로 이동
+            if device is not None:
+                input_ids = {key: value.to(device) for key, value in input_ids.items()}
+            
+            print(f"\n[Generating] Input shape: {input_ids['input_ids'].shape}, Attention mask shape: {input_ids['attention_mask'].shape}")
+            if past_key_values is not None:
+                print(f"[Using Past KV] Layers: {len(past_key_values)}, Full KV Key shape: {past_key_values[0][0].shape}")
+
+            # 토큰별 생성 (KV cache를 매 iteration마다 사용)
+            current_input_ids = input_ids['input_ids']
+            current_attention_mask = input_ids['attention_mask']
+            
+            generated_token_ids = []
+            output_tokens_text = []
+            kv_cache = None
+            
+            for step in range(max_new_tokens):
+                # KV cache 슬라이싱 (필요한 길이만큼만 사용)
+                if past_key_values is not None:
+                    kv_length = original_input_length + step - 1
+                    
+                    # DynamicCache를 슬라이싱
+                    # DynamicCache를 legacy tuple 형식으로 변환
+                    if hasattr(past_key_values, 'to_legacy_cache'):
+                        legacy_cache = past_key_values.to_legacy_cache()
+                    else:
+                        # DynamicCache를 직접 접근
+                        legacy_cache = [(past_key_values[i][0], past_key_values[i][1]) for i in range(len(past_key_values))]
+                    
+                    # 슬라이싱 후 다시 DynamicCache로 변환
+                    current_kv = DynamicCache()
+                    for layer_idx, (key, value) in enumerate(legacy_cache):
+                        sliced_key = key[:, :, :kv_length, :]
+                        sliced_value = value[:, :, :kv_length, :]
+                        current_kv.update(sliced_key, sliced_value, layer_idx)
+                    
+                    current_attention_mask = torch.ones((1, kv_length + 1), dtype=torch.long, device=device if device else current_input_ids.device)
+                    
+                    if step == 0:
+                        print(f"\n[Step {step}] Using KV cache length: {kv_length} (sliced from {legacy_cache[0][0].shape[2]}), Attention mask length: {current_attention_mask.shape[1]}")
+                else:
+                    current_kv = None
+                    current_attention_mask = torch.ones((1, original_input_length + step), dtype=torch.long, device=device if device else current_input_ids.device)
+
+                if step == 0:
+                    if past_key_values is not None:
+                        print(f"<<{idx}. Attention Mask: {current_attention_mask.shape}, KV used with length {kv_length}, Original input length: {original_input_length}")
+                    else:
+                        print(f"<<{idx}. Attention Mask: {current_attention_mask.shape}")
+                    print(f"<<{idx}. input: {prompt_text}")
+                    print(f"<<{idx}. Generated:", end='', flush=True)
+
+                # forward pass
+                with torch.no_grad():
+                    outputs = model(
+                        input_ids=current_input_ids,
+                        attention_mask=current_attention_mask,
+                        past_key_values=current_kv,
+                        use_cache=True,
+                        return_dict=True
+                    )
+                
+                # greedy decoding
+                next_token_logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+                # 마지막에 저장된 kv_cache 업데이트
+                if step == max_new_tokens - 1 and past_key_values is None:
+                    kv_cache = outputs.past_key_values
+                
+                generated_token_ids.append(next_token_id.item())
+                token_text = tokenizer.decode([next_token_id.item()], skip_special_tokens=False)
+                output_tokens_text.append(token_text)
+                
+                # 진행상황 출력
+                if '\n' in token_text:
+                    print(' \\n ', end='', flush=True)
+                else:
+                    print(token_text, end='', flush=True)
+                
+                # EOS 토큰 체크
+                eos_token_id = tokenizer.eos_token_id
+                if next_token_id.item() == eos_token_id:
+                    print(f"\n[EOS reached at step {step+1}]")
+                    break
+            
+                current_input_ids = next_token_id
+            
+            print()
+            
+            generated_texts = tokenizer.decode(generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            print(f"\n[Generated text]: {generated_texts}")
+
+            # KV cache 저장 (save=True인 경우만)
+            if save_kv:
+                # past_key_values를 사용한 경우, 원본 입력의 KV cache를 저장해야 하므로
+                # 여기서는 로드하지 않고 생성한 경우에만 저장
+                if past_key_values is None and kv_cache is not None:
+                    save_kv_cache(
+                        kv_cache=kv_cache,
+                        input_text=input_tokens_text,  # list 형태로 저장
+                        input_tokens=input_token_ids,  # list 형태로 저장
+                        output_text=output_tokens_text,  # list 형태로 저장
+                        output_tokens=generated_token_ids,  # list 형태로 저장
+                        model_name=model_name,
+                        device_name=device_name,
+                        input_index=idx,
+                        output_dir=output_path
+                    )
+                else:
+                    print(f"[KV Cache] Skipped saving (loaded from cache or no cache available)")
+            
+            # CSV 저장용 텍스트 전처리
             processed_input_text = "|||".join([t.replace(',', ' <comma> ').replace('\n', ' <br> ') for t in input_tokens_text])
             processed_input_tokens = "|||".join([str(t) for t in input_token_ids])
-            
-            # print(f"{idx}. Attention mask shape:{input_ids['attention_mask'].shape}, {input_ids['attention_mask']}")
-            print(f"<<{idx}. Generated:", end='', flush=True)
-            # current_attention_mask = input_ids['attention_mask']
-            outputs = model.generate(
-                input_ids=input_ids['input_ids'],
-                attention_mask=input_ids['attention_mask'],  # 중요: attention_mask 명시적으로 전달
-                max_new_tokens=max_new_tokens,
-                do_sample=False,  
-                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-                return_dict_in_generate=True,  # dict 형태로 반환
-                output_scores=True,  # 각 생성 단계의 score 반환
-            )
-            
-            # KV cache와 생성된 시퀀스 추출
-            generated_sequences = outputs.sequences
-            if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
-                kv_cache = outputs.past_key_values
-                print(f"\nKV cache available: {len(kv_cache)} layers")
-                # 각 레이어의 key, value shape 확인
-                if len(kv_cache) > 0:
-                    print(f"Layer 0 - Key shape: {kv_cache[0][0].shape}, Value shape: {kv_cache[0][1].shape}")
-            else:
-                kv_cache = None
-                print("\nNo KV cache returned")
-            
-            # 출력 토큰화 (입력 부분 제외)
-            output_token_ids = generated_sequences[0][input_ids['input_ids'].shape[-1]:].tolist()
-            output_tokens_text = [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in output_token_ids]
-            
-            # 출력 텍스트 전처리
             processed_output_text = "|||".join([t.replace(',', ' <comma> ').replace('\n', ' <br> ') for t in output_tokens_text])
-            processed_output_tokens = "|||".join([str(t) for t in output_token_ids])
-            
-            generated_texts = tokenizer.decode(
-                generated_sequences[0][input_ids['input_ids'].shape[-1]:], skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )
-            print(generated_texts)
+            processed_output_tokens = "|||".join([str(t) for t in generated_token_ids])
             
             # CSV 저장
             csv_data = {
@@ -213,32 +542,3 @@ if __name__ == "__main__":
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         gc.collect()
         print(f"Model {model_name} unloaded and memory cleared.")
-        
-            # past_kv = None
-            # for decoding_idx in range(max_new_tokens): 
-            #     outputs = model(
-            #         input_ids=input_ids['input_ids'], 
-            #         attention_mask=current_attention_mask,
-            #         past_key_values = past_kv if decoding_idx > 0 else None,
-            #         use_cache=True,
-            #         return_dict=True
-            #     )
-            #     print(outputs)
-            #     next_token_ids = torch.argmax(outputs.logits, dim=-1, keepdim=True)[0][0][0]
-            #     text_token = tokenizer.decode(next_token_ids, skip_special_tokens=True)
-            #     past_kv = outputs.past_key_values
-
-            #     input_ids = tokenizer(text_token, return_tensors="pt")
-            #     if '\n' in text_token:
-            #         display_text = text_token.replace('\n', ' \\n ')
-            #     else:
-            #         display_text = text_token
-
-            #     print(display_text, end='', flush=True)
-
-            #     current_attention_mask = torch.cat(
-            #         [current_attention_mask, torch.ones((1,1), dtype=current_attention_mask.dtype)], dim=-1
-            #     )
-            #     print(f"{idx}.{decoding_idx} Current attention mask shape:{current_attention_mask.shape}, {current_attention_mask}")
-
-            # print('-' * 80)

@@ -1,0 +1,24 @@
+{
+  "max_new_tokens": 128,
+  "batch_size": 1,
+  "request_number": 16,
+  "activation_checkpointing": false,
+  "token_checkpoint": true,
+  "in_out_value_check": false,
+  "models": [
+      "Qwen/Qwen3-4B-FP8"
+    ],
+  "inputs": ["Hello, how are you?"],
+  "dataset": {
+    "dir": "dataset/HuggingFaceH4_ultrachat_200k_test_sft_64_processed.jsonl",
+    "name": "HuggingFaceH4/ultrachat_200k",
+    "split": "test_sft",
+    "num_samples": 4096
+  },
+  "kv_cache": {
+    "save": false,
+    "save_mode": "delta",
+    "load": true,
+    "load_from_device": "kv_cache/NVIDIA_H200"
+  }
+}

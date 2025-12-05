@@ -105,6 +105,7 @@ def model_load(model_name):
     qantized_flag = True if 'FP8' in model_name or 'quantized' in model_name or '4bit' in model_name or 'w8a8' in model_name else False
     if qantized_flag:
         if 'w8a8' in model_name:
+            print("Loading W8A8 quantized model...")
             from transformers import modeling_utils
             original_load_param = modeling_utils._load_parameter_into_model
             
@@ -168,6 +169,7 @@ def model_load(model_name):
             finally:
                 modeling_utils._load_parameter_into_model = original_load_param
         else:
+            print("Loading quantized model...")
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto" if torch.cuda.is_available() else None,
@@ -176,6 +178,7 @@ def model_load(model_name):
                 low_cpu_mem_usage=True,
             )
     else:
+        print("Loading full precision model (FP16)...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="auto" if torch.cuda.is_available() else None,
@@ -400,6 +403,13 @@ if __name__ == "__main__":
     print(f"KV Cache Config - Save: {save_kv}, Load: {load_kv}")
     if load_kv:
         print(f"Loading KV cache from: {load_from_device}")
+    
+    # parameter.json 파일을 output 폴더에 복사
+    import shutil
+    param_source = "parameter.json"
+    param_dest = os.path.join(output_path, "parameter.json")
+    shutil.copy2(param_source, param_dest)
+    print(f"Saved parameter.json to {param_dest}")
 
     csv_headers = ['device', 'model', 'type', 'batch_size', 'data_index', 'input_text', 'input_tokens', 'output_text', 'output_tokens', 'mismatch', 'mismatch_index']
     csv_file_path = os.path.join(output_path, f"{device_name.replace(' ', '_')}_input_output_summary_{start_time}.csv")

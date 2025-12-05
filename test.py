@@ -256,7 +256,8 @@ def save_model_weights(model, model_name, device_type, output_dir):
 def load_kv_cache(model_name, input_index, load_from_device, device):
     """저장된 KV cache 로드"""
     model_basename = model_name.replace('/', '_')
-    kv_file = os.path.join(load_from_device, f"{model_basename}_input{input_index}.pt")
+    model_dir = os.path.join(load_from_device, model_basename)
+    kv_file = os.path.join(model_dir, f"input{input_index}.pt")
     
     if not os.path.exists(kv_file):
         print(f"Warning: KV cache file not found: {kv_file}")
@@ -289,13 +290,14 @@ def save_kv_cache(kv_cache, input_text, input_tokens, output_text, output_tokens
     """KV cache와 입출력 데이터를 저장"""
     # 디바이스별 디렉토리 생성
     device_dir = os.path.join(output_dir, device_name.replace(' ', '_'))
-    os.makedirs(device_dir, exist_ok=True)
     
-    # 전체 모델 이름 유지 (/ -> _로 변환)
+    # 모델별 폴더 생성 (/ -> _로 변환)
     model_basename = model_name.replace('/', '_')
+    model_dir = os.path.join(device_dir, model_basename)
+    os.makedirs(model_dir, exist_ok=True)
     
     # KV cache 파일명
-    kv_file = os.path.join(device_dir, f"{model_basename}_input{input_index}.pt")
+    kv_file = os.path.join(model_dir, f"input{input_index}.pt")
     
     # KV cache 데이터 준비
     kv_data = {
@@ -346,7 +348,7 @@ def save_kv_cache(kv_cache, input_text, input_tokens, output_text, output_tokens
     print(f"Saved KV cache to {kv_file}")
     
     # 메타데이터 JSON 저장 (KV cache 텐서 제외)
-    meta_file = os.path.join(device_dir, f"{model_basename}_input{input_index}_meta.json")
+    meta_file = os.path.join(model_dir, f"input{input_index}_meta.json")
     meta_data = {
         'input_text': input_text,
         'input_tokens': input_tokens,

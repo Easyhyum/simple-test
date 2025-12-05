@@ -196,7 +196,7 @@ def load_kv_cache(model_name, input_index, load_from_device, device):
     
     if not os.path.exists(kv_file):
         print(f"Warning: KV cache file not found: {kv_file}")
-        return None, None, None
+        raise FileNotFoundError(f"KV cache file not found: {kv_file}")
     
     print(f"Loading KV cache from {kv_file}")
     kv_data = torch.load(kv_file, map_location='cpu')
@@ -216,8 +216,9 @@ def load_kv_cache(model_name, input_index, load_from_device, device):
     
     # input_tokens는 이미 list 형태
     input_token_ids = kv_data['input_tokens']
-    
-    return kv_cache, input_token_ids, kv_data
+    output_token_idx = kv_data['output_tokens']
+    output_token_text = kv_data['output_text']
+    return kv_cache, input_token_ids, kv_data, output_token_idx, output_token_text
 
 def save_kv_cache(kv_cache, input_text, input_tokens, output_text, output_tokens, 
                   model_name, device_name, input_index, output_dir):
@@ -334,7 +335,7 @@ if __name__ == "__main__":
     if load_kv:
         print(f"Loading KV cache from: {load_from_device}")
 
-    csv_headers = ['device', 'model', 'type', 'batch_size', 'data_index', 'input_text', 'input_tokens', 'output_text', 'output_tokens']
+    csv_headers = ['device', 'model', 'type', 'batch_size', 'data_index', 'input_text', 'input_tokens', 'output_text', 'output_tokens', 'mismatch', 'mismatch_index']
     csv_file_path = os.path.join(output_path, f"{device_name.replace(' ', '_')}_input_output_summary_{start_time}.csv")
 
     for model_name in model_list:
@@ -374,7 +375,7 @@ if __name__ == "__main__":
             original_input_length = len(input_token_ids)
             
             if load_kv:
-                loaded_kv, loaded_input_tokens, loaded_data = load_kv_cache(
+                loaded_kv, loaded_input_tokens, loaded_data, loaded_output_token_idx, loaded_output_token_text = load_kv_cache(
                     model_name=model_name,
                     input_index=idx,
                     load_from_device=load_from_device,
@@ -414,7 +415,8 @@ if __name__ == "__main__":
             generated_token_ids = []
             output_tokens_text = []
             kv_cache = None
-            
+            mismatch_found = False
+            mismatch_index = -1
             for step in range(max_new_tokens):
                 # KV cache 슬라이싱 (필요한 길이만큼만 사용)
                 if past_key_values is not None:
@@ -440,7 +442,8 @@ if __name__ == "__main__":
                     if step == 0:
                         print(f"\n[Step {step}] Using KV cache length: {kv_length} (sliced from {legacy_cache[0][0].shape[2]}), Attention mask length: {current_attention_mask.shape[1]}")
                 else:
-                    current_kv = None
+                    if step == 0:
+                        current_kv = None
                     current_attention_mask = torch.ones((1, original_input_length + step), dtype=torch.long, device=device if device else current_input_ids.device)
 
                 if step == 0:
@@ -469,10 +472,20 @@ if __name__ == "__main__":
                 if step == max_new_tokens - 1 and past_key_values is None:
                     kv_cache = outputs.past_key_values
                 
+                if not load_kv:
+                    current_kv = outputs.past_key_values
+
                 generated_token_ids.append(next_token_id.item())
                 token_text = tokenizer.decode([next_token_id.item()], skip_special_tokens=False)
                 output_tokens_text.append(token_text)
                 
+                if load_kv:
+                    if loaded_output_token_idx[step] != next_token_id.item():
+                        print(f"\n[Warning] mismatch step:{step+1} Loaded: {loaded_output_token_text[step]} ({loaded_output_token_idx[step]}), Generated: {token_text} ({next_token_id.item()})")
+                        mismatch_found = True
+                        mismatch_index = step
+                        break
+
                 # 진행상황 출력
                 if '\n' in token_text:
                     print(' \\n ', end='', flush=True)
@@ -527,7 +540,9 @@ if __name__ == "__main__":
                 'input_text': processed_input_text,
                 'input_tokens': processed_input_tokens,
                 'output_text': processed_output_text,
-                'output_tokens': processed_output_tokens
+                'output_tokens': processed_output_tokens,
+                'mismatch': mismatch_found,
+                'mismatch_index': mismatch_index
             }
             save_csv(csv_file_path, csv_data, csv_headers)
             

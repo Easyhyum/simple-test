@@ -5,9 +5,7 @@
   "activation_checkpointing": false,
   "token_checkpoint": true,
   "in_out_value_check": false,
-  "models": [
-      "Qwen/Qwen3-4B-FP8"
-    ],
+  "models": ["Qwen/Qwen3-4B-FP8"],
   "inputs": ["Hello, how are you?"],
   "dataset": {
     "dir": "dataset/HuggingFaceH4_ultrachat_200k_test_sft_64_processed.jsonl",

@@ -104,13 +104,77 @@ def model_load_npu(model_name):
 def model_load(model_name):
     qantized_flag = True if 'FP8' in model_name or 'quantized' in model_name or '4bit' in model_name or 'w8a8' in model_name else False
     if qantized_flag:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            attn_implementation="eager",
-            low_cpu_mem_usage=True,
-        )
+        if 'w8a8' in model_name:
+            from transformers import modeling_utils
+            original_load_param = modeling_utils._load_parameter_into_model
+            
+            def patched_load_param(model, param_name, tensor):
+                # For int8 tensors or any non-float tensors, set requires_grad=False explicitly
+                if tensor.dtype in [torch.int8, torch.uint8] or not tensor.is_floating_point():
+                    module_name, param_type = param_name.rsplit(".", 1)
+                    module = model
+                    for name in module_name.split("."):
+                        module = getattr(module, name)
+                    # Directly set the parameter/buffer without gradient checking
+                    param = torch.nn.Parameter(tensor, requires_grad=False)
+                    if param_type == "weight":
+                        module.weight = param
+                    elif param_type == "bias":
+                        module.bias = param
+                    else:
+                        # For scale, zero_point, etc., set as attribute
+                        setattr(module, param_type, param)
+                else:
+                    original_load_param(model, param_name, tensor)
+            
+            modeling_utils._load_parameter_into_model = patched_load_param
+            
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    attn_implementation="eager",
+                    device_map=None,  # CPU에 먼저 로드
+                    low_cpu_mem_usage=True,
+                )
+                
+                # After loading, replace forward method for INT8 quantized layers
+                quantized_layer_count = 0
+                
+                def create_dequant_forward(original_forward, weight_scale):
+                    def dequant_forward(self, input):
+                        # Dequantize on-the-fly
+                        x = input
+                        target_dtype = x.dtype
+                        
+                        # Dequantize weight
+                        weight_float = self.weight.to(target_dtype) * weight_scale.to(target_dtype)
+                        
+                        # Perform linear operation
+                        return torch.nn.functional.linear(x, weight_float, self.bias)
+                    return dequant_forward
+                
+                # Replace forward method for all quantized Linear layers
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear) and hasattr(module, 'weight_scale') and module.weight.dtype == torch.int8:
+                        # Save weight_scale
+                        weight_scale = module.weight_scale
+                        # Replace the forward method
+                        module.forward = create_dequant_forward(module.forward, weight_scale).__get__(module, type(module))
+                        quantized_layer_count += 1
+                
+                print(f"Replaced forward method for {quantized_layer_count} quantized Linear layers")
+                        
+            finally:
+                modeling_utils._load_parameter_into_model = original_load_param
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto" if torch.cuda.is_available() else None,
+                trust_remote_code=True,
+                attn_implementation="eager",
+                low_cpu_mem_usage=True,
+            )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -532,7 +596,7 @@ if __name__ == "__main__":
             
             # CSV 저장
             csv_data = {
-                'device': device_name,
+                'device': f"{device_name}_Aware" if load_kv else device_name,
                 'model': model_name,
                 'type': device_type,
                 'batch_size': batch_size,
